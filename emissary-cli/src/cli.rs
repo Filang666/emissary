@@ -154,6 +154,10 @@ pub struct RouterUiOptions {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub disable_ui: Option<bool>,
 
+    /// Use native UI.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub native: Option<bool>,
+
     /// Router UI refresh interval
     ///
     /// How often are events gathered from different subsystem and redrawn in the UI
@@ -171,13 +175,6 @@ pub struct RouterUiOptions {
     /// Has an effect only if web UI was enabled during compilation.
     #[arg(long, value_name = "PORT")]
     pub web_ui_port: Option<u16>,
-
-    /// Use web UI instead of native UI.
-    ///
-    /// Has an effect only if both web UI and native UI were enabled during compilation.
-    /// Defaults to native UI.
-    #[arg(long, action = clap::ArgAction::SetTrue)]
-    pub web_ui: Option<bool>,
 }
 
 #[derive(Args, Default)]

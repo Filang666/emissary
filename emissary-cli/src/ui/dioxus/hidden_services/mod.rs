@@ -16,40 +16,24 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use crate::config::EmissaryConfig;
+use dioxus::prelude::*;
 
-use std::{
-    collections::BTreeMap,
-    fs::File,
-    io::{BufRead, BufReader},
-    path::PathBuf,
-    sync::Arc,
-};
+pub mod client;
+pub mod overview;
+pub mod server;
 
-/// Load Base32 addresses from disk.
-pub fn load_addresses(path: PathBuf) -> BTreeMap<Arc<str>, Arc<str>> {
-    let Ok(file) = File::open(&path) else {
-        tracing::warn!(
-            target: "emissary::ui",
-            path = %path.display(),
-            "failed to open address book file",
-        );
-        return BTreeMap::new();
-    };
-    let reader = BufReader::new(file);
+#[component]
+pub fn HiddenServicesView() -> Element {
+    rsx! {
+        div {
+            class: "page",
+            div {
+                class: "page-title",
+                h1 { "Hidden services and client tunnels" }
+                p { "Configure hidden services and client tunnels" }
+            }
 
-    reader
-        .lines()
-        .filter_map(|line| {
-            let line = line.ok()?;
-            let (key, value) = line.split_once('=')?;
-
-            Some((Arc::from(key), Arc::from(format!("http://{value}.b32.i2p"))))
-        })
-        .collect()
-}
-
-/// Save router configuration to disk.
-pub fn save_router_config(path: PathBuf, config: &EmissaryConfig) {
-    std::fs::write(path, toml::to_string(config).unwrap()).unwrap();
+            overview::HiddenServiceOverview {}
+        }
+    }
 }

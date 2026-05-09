@@ -18,6 +18,16 @@
 
 use std::collections::VecDeque;
 
+/// Time range for bandwidth graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimeRange {
+    #[default]
+    Live,
+    TenMin,
+    OneHour,
+    SixHours,
+}
+
 /// A single bandwidth sample or an aggregate bucket.
 #[derive(Clone, Default)]
 pub struct TimeBucket {
