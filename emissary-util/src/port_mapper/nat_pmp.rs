@@ -25,7 +25,8 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
-use std::{future::Future, net::Ipv4Addr, time::Duration};
+use std::net::Ipv4Addr;
+use std::time::Duration;
 
 /// Logging target for the file
 const LOG_TARGET: &str = "emissary-util::port-mapper::nat-pmp";
@@ -85,35 +86,6 @@ impl PortMapper {
         }
     }
 
-    /// Attempt to execute a future with retries and timeout.
-    ///
-    /// The operation is a closure that returns a fresh future each time.
-    /// This avoids the bug of polling the same future multiple times.
-    async fn with_retries_and_timeout<T, Fut>(
-    mut operation: impl FnMut() -> Fut,
-) -> Result<T, ()>
-where
-    Fut: std::future::Future<Output = natpmp::Result<T>> + std::marker::Unpin,
-{
-    for _ in 0..NUM_RETRIES {
-        let future = operation();
-        match tokio::time::timeout(RESPONSE_TIMEOUT, future).await {
-            Err(_) => tracing::debug!(
-                target: LOG_TARGET,
-                "operation timed out",
-            ),
-            Ok(Err(error)) => tracing::debug!(
-                target: LOG_TARGET,
-                ?error,
-                "operation failed",
-            ),
-            Ok(Ok(res)) => return Ok(res),
-        }
-    }
-
-    Err(())
-}
-
     /// If NAT-PMP initialization failed, attempt to use UPnP as a backup if it was enabled.
     ///
     /// If UPnP was not enabled, [`PortMapper`] will shutdown and no port forwarding/external
@@ -144,147 +116,113 @@ where
         );
     }
 
-    /// Attempt to map NTCP2 port.
-    ///
-    /// Returns `Err(())` if the operation failed after multiple retries and `Ok(None)` if NTCP2 is
-    /// disabled.
-    async fn try_map_ntcp2(&self, client: &NatpmpAsync<UdpSocket>) -> Result<Option<Response>, ()> {
-        let Some(ntcp2_port) = self.ntcp2_port else {
-            return Ok(None);
-        };
-
-        tracing::trace!(
-            target: LOG_TARGET,
-            ?ntcp2_port,
-            "map ntcp2 port",
-        );
-
-        Self::with_retries_and_timeout(|| {
-            async {
+    /// Attempt to map NTCP2 port with retries.
+    async fn try_map_ntcp2(client: &NatpmpAsync<UdpSocket>, port: u16) -> Result<Response, ()> {
+        for _ in 0..NUM_RETRIES {
+            let result = tokio::time::timeout(RESPONSE_TIMEOUT, async {
                 client
-                    .send_port_mapping_request(
-                        Protocol::TCP,
-                        ntcp2_port,
-                        ntcp2_port,
-                        PORT_MAPPING_LIFETIME,
-                    )
+                    .send_port_mapping_request(Protocol::TCP, port, port, PORT_MAPPING_LIFETIME)
                     .await?;
                 client.read_response_or_retry().await
+            })
+            .await;
+
+            match result {
+                Err(_) => tracing::debug!(target: LOG_TARGET, "map ntcp2 timeout"),
+                Ok(Err(e)) => tracing::debug!(target: LOG_TARGET, ?e, "map ntcp2 failed"),
+                Ok(Ok(resp)) => return Ok(resp),
             }
-            .boxed()
-        })
-        .await
-        .map(Some)
+        }
+        Err(())
     }
 
-    /// Attempt to map SSU2 port.
-    ///
-    /// Returns `Err(())` if the operation failed after multiple retries and `Ok(None)` if SSU2 is
-    /// disabled.
-    async fn try_map_ssu2(&self, client: &NatpmpAsync<UdpSocket>) -> Result<Option<Response>, ()> {
-        let Some(ssu2_port) = self.ssu2_port else {
-            return Ok(None);
-        };
-
-        tracing::trace!(
-            target: LOG_TARGET,
-            ?ssu2_port,
-            "map ssu2 port",
-        );
-
-        Self::with_retries_and_timeout(|| {
-            async {
+    /// Attempt to map SSU2 port with retries.
+    async fn try_map_ssu2(client: &NatpmpAsync<UdpSocket>, port: u16) -> Result<Response, ()> {
+        for _ in 0..NUM_RETRIES {
+            let result = tokio::time::timeout(RESPONSE_TIMEOUT, async {
                 client
-                    .send_port_mapping_request(
-                        Protocol::UDP,
-                        ssu2_port,
-                        ssu2_port,
-                        PORT_MAPPING_LIFETIME,
-                    )
+                    .send_port_mapping_request(Protocol::UDP, port, port, PORT_MAPPING_LIFETIME)
                     .await?;
                 client.read_response_or_retry().await
+            })
+            .await;
+
+            match result {
+                Err(_) => tracing::debug!(target: LOG_TARGET, "map ssu2 timeout"),
+                Ok(Err(e)) => tracing::debug!(target: LOG_TARGET, ?e, "map ssu2 failed"),
+                Ok(Ok(resp)) => return Ok(resp),
             }
-            .boxed()
-        })
-        .await
-        .map(Some)
+        }
+        Err(())
     }
 
-    /// Attempt to fetch external address of the router.
-    async fn try_get_external_address(
-        client: &mut NatpmpAsync<UdpSocket>,
-    ) -> Result<Option<Ipv4Addr>, ()> {
-        Self::with_retries_and_timeout(|| {
-            async {
+    /// Attempt to fetch external address with retries.
+    async fn try_get_external_address(client: &mut NatpmpAsync<UdpSocket>) -> Result<Ipv4Addr, ()> {
+        for _ in 0..NUM_RETRIES {
+            let result = tokio::time::timeout(RESPONSE_TIMEOUT, async {
                 client.send_public_address_request().await?;
                 client.read_response_or_retry().await
+            })
+            .await;
+
+            match result {
+                Err(_) => tracing::debug!(target: LOG_TARGET, "get external address timeout"),
+                Ok(Err(e)) => tracing::debug!(target: LOG_TARGET, ?e, "get external address failed"),
+                Ok(Ok(resp)) => {
+                    if let Response::Gateway(response) = resp {
+                        return Ok(*response.public_address());
+                    } else {
+                        tracing::warn!(target: LOG_TARGET, ?resp, "unexpected response");
+                    }
+                }
             }
-            .boxed()
-        })
-        .await
-        .map(|result| match result {
-            Response::Gateway(response) => Some(*response.public_address()),
-            response => {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    ?response,
-                    "ignoring unexpected response",
-                );
-                None
-            }
-        })
+        }
+        Err(())
     }
 
     /// Run the event loop of NAT-PMP [`PortMapper`].
     pub async fn run(mut self) {
-        // Initialize NAT-PMP client with retries and timeout.
-        let Ok(mut client) = Self::with_retries_and_timeout(|| new_tokio_natpmp().boxed()).await
-        else {
+        // Initialize NAT-PMP client with retries.
+        let mut client = None;
+        for _ in 0..NUM_RETRIES {
+            match tokio::time::timeout(RESPONSE_TIMEOUT, new_tokio_natpmp()).await {
+                Err(_) => tracing::debug!(target: LOG_TARGET, "init timeout"),
+                Ok(Err(e)) => tracing::debug!(target: LOG_TARGET, ?e, "init failed"),
+                Ok(Ok(c)) => {
+                    client = Some(c);
+                    break;
+                }
+            }
+        }
+        let Some(mut client) = client else {
             return self.try_switch_to_upnp();
         };
 
         // Map NTCP2 port.
-        match self.try_map_ntcp2(&client).await {
-            Ok(None) => {}
-            Err(()) => return self.try_switch_to_upnp(),
-            Ok(Some(Response::TCP(_))) => tracing::debug!(
-                target: LOG_TARGET,
-                "ntcp2 port mapped",
-            ),
-            Ok(Some(Response::UDP(_))) => tracing::debug!(
-                target: LOG_TARGET,
-                "ssu2 port mapped",
-            ),
-            Ok(Some(response)) => tracing::warn!(
-                target: LOG_TARGET,
-                ?response,
-                "ignoring unexpected response",
-            ),
+        if let Some(port) = self.ntcp2_port {
+            match Self::try_map_ntcp2(&client, port).await {
+                Ok(Response::TCP(_)) => tracing::debug!(target: LOG_TARGET, "ntcp2 port mapped"),
+                Ok(other) => tracing::warn!(target: LOG_TARGET, ?other, "unexpected response"),
+                Err(()) => return self.try_switch_to_upnp(),
+            }
         }
 
         // Map SSU2 port.
-        match self.try_map_ssu2(&client).await {
-            Ok(None) => {}
-            Err(()) => return self.try_switch_to_upnp(),
-            Ok(Some(Response::UDP(_))) => tracing::debug!(
-                target: LOG_TARGET,
-                "ssu2 port mapped",
-            ),
-            Ok(Some(response)) => tracing::warn!(
-                target: LOG_TARGET,
-                ?response,
-                "ignoring unexpected response",
-            ),
+        if let Some(port) = self.ssu2_port {
+            match Self::try_map_ssu2(&client, port).await {
+                Ok(Response::UDP(_)) => tracing::debug!(target: LOG_TARGET, "ssu2 port mapped"),
+                Ok(other) => tracing::warn!(target: LOG_TARGET, ?other, "unexpected response"),
+                Err(()) => return self.try_switch_to_upnp(),
+            }
         }
 
         // Get initial external address.
         let mut external_address = match Self::try_get_external_address(&mut client).await {
-            Err(()) => return self.try_switch_to_upnp(),
-            Ok(None) => return self.try_switch_to_upnp(),
-            Ok(Some(address)) => {
-                let _ = self.address_tx.send(address).await;
-                address
+            Ok(addr) => {
+                let _ = self.address_tx.send(addr).await;
+                addr
             }
+            Err(()) => return self.try_switch_to_upnp(),
         };
 
         let mut external_address_timer = Box::pin(tokio::time::sleep(ADDRESS_REFRESH_TIMER));
@@ -296,63 +234,40 @@ where
             tokio::select! {
                 event = &mut self.shutdown_rx => match event {
                     Ok(tx) => {
-                        tracing::info!(
-                            target: LOG_TARGET,
-                            "shutting down nat-pmp port manager",
-                        );
-                        // nat-pmp doesn't need to unmap any ports since the mappings have
-                        // expirations meaning the shutdown response can be sent immediately
+                        tracing::info!(target: LOG_TARGET, "shutting down nat-pmp port manager");
                         let _ = tx.send(());
                         return;
                     }
                     Err(_) => return,
                 },
                 _ = &mut external_address_timer => {
-                    if let Ok(Some(address)) = Self::try_get_external_address(&mut client).await {
-                        if address != external_address {
+                    if let Ok(addr) = Self::try_get_external_address(&mut client).await {
+                        if addr != external_address {
                             tracing::info!(
                                 target: LOG_TARGET,
-                                new_address = ?address,
+                                new_address = ?addr,
                                 previous_address = ?external_address,
                                 "new external address discovered",
                             );
-
-                            let _ = self.address_tx.send(address).await;
-                            external_address = address;
+                            let _ = self.address_tx.send(addr).await;
+                            external_address = addr;
                         }
-                    };
-
+                    }
                     external_address_timer = Box::pin(tokio::time::sleep(ADDRESS_REFRESH_TIMER));
                 }
                 _ = &mut port_mapping_timer => {
                     // Refresh NTCP2 mapping.
-                    match self.try_map_ntcp2(&client).await {
-                        Ok(Some(Response::TCP(_))) => tracing::debug!(
-                            target: LOG_TARGET,
-                            "ntcp2 port remapped",
-                        ),
-                        Ok(Some(response)) => tracing::warn!(
-                            target: LOG_TARGET,
-                            ?response,
-                            "ignoring unexpected response",
-                        ),
-                        _ => {}
+                    if let Some(port) = self.ntcp2_port {
+                        if let Ok(Response::TCP(_)) = Self::try_map_ntcp2(&client, port).await {
+                            tracing::debug!(target: LOG_TARGET, "ntcp2 port remapped");
+                        }
                     }
-
                     // Refresh SSU2 mapping.
-                    match self.try_map_ssu2(&client).await {
-                        Ok(Some(Response::UDP(_))) => tracing::debug!(
-                            target: LOG_TARGET,
-                            "ssu2 port remapped",
-                        ),
-                        Ok(Some(response)) => tracing::warn!(
-                            target: LOG_TARGET,
-                            ?response,
-                            "ignoring unexpected response",
-                        ),
-                        _ => {}
+                    if let Some(port) = self.ssu2_port {
+                        if let Ok(Response::UDP(_)) = Self::try_map_ssu2(&client, port).await {
+                            tracing::debug!(target: LOG_TARGET, "ssu2 port remapped");
+                        }
                     }
-
                     port_mapping_timer = Box::pin(tokio::time::sleep(Duration::from_secs(
                         (PORT_MAPPING_LIFETIME - 10) as u64,
                     )));
