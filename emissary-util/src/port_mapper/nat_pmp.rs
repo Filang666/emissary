@@ -85,15 +85,16 @@ impl PortMapper {
         }
     }
 
-    /// Attempt to execute `future` with with retries and timeout.
+    /// Attempt to execute a future with retries and timeout.
     ///
-    /// If the future fails after `NUM_RETRIES` many retries, either due to error or timeout, the
-    /// function returns `None` which the caller should consider as fatal failure.
+    /// The operation is a closure that returns a fresh future each time.
+    /// This avoids the bug of polling the same future multiple times.
     async fn with_retries_and_timeout<T>(
-        mut future: impl Future<Output = natpmp::Result<T>> + Unpin,
+        mut operation: impl FnMut() -> (impl Future<Output = natpmp::Result<T>> + Unpin),
     ) -> Result<T, ()> {
         for _ in 0..NUM_RETRIES {
-            match tokio::time::timeout(RESPONSE_TIMEOUT, &mut future).await {
+            let future = operation();
+            match tokio::time::timeout(RESPONSE_TIMEOUT, future).await {
                 Err(_) => tracing::debug!(
                     target: LOG_TARGET,
                     "operation timed out",
@@ -155,7 +156,7 @@ impl PortMapper {
             "map ntcp2 port",
         );
 
-        Self::with_retries_and_timeout(
+        Self::with_retries_and_timeout(|| {
             async {
                 client
                     .send_port_mapping_request(
@@ -167,8 +168,8 @@ impl PortMapper {
                     .await?;
                 client.read_response_or_retry().await
             }
-            .boxed(),
-        )
+            .boxed()
+        })
         .await
         .map(Some)
     }
@@ -188,7 +189,7 @@ impl PortMapper {
             "map ssu2 port",
         );
 
-        Self::with_retries_and_timeout(
+        Self::with_retries_and_timeout(|| {
             async {
                 client
                     .send_port_mapping_request(
@@ -200,8 +201,8 @@ impl PortMapper {
                     .await?;
                 client.read_response_or_retry().await
             }
-            .boxed(),
-        )
+            .boxed()
+        })
         .await
         .map(Some)
     }
@@ -210,13 +211,13 @@ impl PortMapper {
     async fn try_get_external_address(
         client: &mut NatpmpAsync<UdpSocket>,
     ) -> Result<Option<Ipv4Addr>, ()> {
-        Self::with_retries_and_timeout(
+        Self::with_retries_and_timeout(|| {
             async {
                 client.send_public_address_request().await?;
                 client.read_response_or_retry().await
             }
-            .boxed(),
-        )
+            .boxed()
+        })
         .await
         .map(|result| match result {
             Response::Gateway(response) => Some(*response.public_address()),
@@ -233,11 +234,13 @@ impl PortMapper {
 
     /// Run the event loop of NAT-PMP [`PortMapper`].
     pub async fn run(mut self) {
-        let Ok(mut client) = Self::with_retries_and_timeout(new_tokio_natpmp().boxed()).await
+        // Initialize NAT-PMP client with retries and timeout.
+        let Ok(mut client) = Self::with_retries_and_timeout(|| new_tokio_natpmp().boxed()).await
         else {
             return self.try_switch_to_upnp();
         };
 
+        // Map NTCP2 port.
         match self.try_map_ntcp2(&client).await {
             Ok(None) => {}
             Err(()) => return self.try_switch_to_upnp(),
@@ -256,6 +259,7 @@ impl PortMapper {
             ),
         }
 
+        // Map SSU2 port.
         match self.try_map_ssu2(&client).await {
             Ok(None) => {}
             Err(()) => return self.try_switch_to_upnp(),
@@ -270,6 +274,7 @@ impl PortMapper {
             ),
         }
 
+        // Get initial external address.
         let mut external_address = match Self::try_get_external_address(&mut client).await {
             Err(()) => return self.try_switch_to_upnp(),
             Ok(None) => return self.try_switch_to_upnp(),
@@ -292,7 +297,6 @@ impl PortMapper {
                             target: LOG_TARGET,
                             "shutting down nat-pmp port manager",
                         );
-
                         // nat-pmp doesn't need to unmap any ports since the mappings have
                         // expirations meaning the shutdown response can be sent immediately
                         let _ = tx.send(());
@@ -318,6 +322,7 @@ impl PortMapper {
                     external_address_timer = Box::pin(tokio::time::sleep(ADDRESS_REFRESH_TIMER));
                 }
                 _ = &mut port_mapping_timer => {
+                    // Refresh NTCP2 mapping.
                     match self.try_map_ntcp2(&client).await {
                         Ok(Some(Response::TCP(_))) => tracing::debug!(
                             target: LOG_TARGET,
@@ -331,6 +336,7 @@ impl PortMapper {
                         _ => {}
                     }
 
+                    // Refresh SSU2 mapping.
                     match self.try_map_ssu2(&client).await {
                         Ok(Some(Response::UDP(_))) => tracing::debug!(
                             target: LOG_TARGET,
