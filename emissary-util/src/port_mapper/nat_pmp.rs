@@ -89,27 +89,30 @@ impl PortMapper {
     ///
     /// The operation is a closure that returns a fresh future each time.
     /// This avoids the bug of polling the same future multiple times.
-    async fn with_retries_and_timeout<T>(
-        mut operation: impl FnMut() -> (impl Future<Output = natpmp::Result<T>> + Unpin),
-    ) -> Result<T, ()> {
-        for _ in 0..NUM_RETRIES {
-            let future = operation();
-            match tokio::time::timeout(RESPONSE_TIMEOUT, future).await {
-                Err(_) => tracing::debug!(
-                    target: LOG_TARGET,
-                    "operation timed out",
-                ),
-                Ok(Err(error)) => tracing::debug!(
-                    target: LOG_TARGET,
-                    ?error,
-                    "operation failed",
-                ),
-                Ok(Ok(res)) => return Ok(res),
-            }
+    async fn with_retries_and_timeout<T, Fut>(
+    mut operation: impl FnMut() -> Fut,
+) -> Result<T, ()>
+where
+    Fut: std::future::Future<Output = natpmp::Result<T>> + std::marker::Unpin,
+{
+    for _ in 0..NUM_RETRIES {
+        let future = operation();
+        match tokio::time::timeout(RESPONSE_TIMEOUT, future).await {
+            Err(_) => tracing::debug!(
+                target: LOG_TARGET,
+                "operation timed out",
+            ),
+            Ok(Err(error)) => tracing::debug!(
+                target: LOG_TARGET,
+                ?error,
+                "operation failed",
+            ),
+            Ok(Ok(res)) => return Ok(res),
         }
-
-        Err(())
     }
+
+    Err(())
+}
 
     /// If NAT-PMP initialization failed, attempt to use UPnP as a backup if it was enabled.
     ///
